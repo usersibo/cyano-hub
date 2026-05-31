@@ -1,4 +1,5 @@
 local RS = game:GetService("ReplicatedStorage")
+local Config = require(RS.Modules.Config)
 local Network = require(RS.Modules.Network)
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -25,7 +26,17 @@ local function loadLuxtLib()
             end
         end
     end
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/usersibo/cyanogen/refs/heads/main/cyanogen.lua"))()
+    local urls = {
+        "https://raw.githubusercontent.com/usersibo/cyano-hub/refs/heads/main/cyanogen.lua",
+        "https://raw.githubusercontent.com/usersibo/cyanogen/refs/heads/main/cyanogen.lua",
+    }
+    for _, url in ipairs(urls) do
+        local ok, lib = pcall(function()
+            return loadstring(game:HttpGet(url))()
+        end)
+        if ok and lib then return lib end
+    end
+    error("[Cyanogen] GUI lib not found")
 end
 
 local Luxtl = loadLuxtLib()
@@ -59,7 +70,6 @@ local creditsTab = Luxt:Tab("Credits", 71870986260398)
 
 -- ========== STATE ==========
 local espEnabled = false
-local tempVEspEnabled = false
 local labelEnabled = false
 local teamEspEnabled = false
 local homelanderEspEnabled = false
@@ -91,20 +101,37 @@ local noDoorCollision = false
 local streamSpoofEnabled = false
 local chokeRangeEnabled = false
 
-local silentAimEnabled = false
+local silentAimEnabled = true
 local silentAimFov = 280
 local laserLockTarget = nil
 local laserLockUntil = 0
 local lastLaserNetTick = 0
+local serverConeFix = true
+local serverRaycastOnly = true
+local wallTryMode = false
+local alignCameraToTarget = true
+local autoLaserStop = true
+local preOverheatStop = true
+local preOverheatPercent = 88
+local cameraAlignStrength = 0.12
+local lastValidHitAt = 0
+local lastHadTargetAt = 0
+local laserStartAt = 0
 
 local CHOKE_RANGE = 13
 local RING_SIZE = CHOKE_RANGE * 2
-local LASER_TICK = 0.05
+local LASER_TICK = Config.LaserServerTickRate or 0.05
+local LASER_MAX_RANGE = Config.LaserMaxRange or 500
+local LASER_MAX_ANGLE = Config.LaserMaxAimAngle or 80
+local LASER_COS_ANGLE = math.cos(math.rad(LASER_MAX_ANGLE))
+local LASER_GRACE = Config.LaserTargetGracePeriod or 0.15
+local TEMPV_LASER_RANGE = Config.TempVLaserRange or 200
+local TEMPV_MAX_HEAT = Config.TempVLaserMaxHeat or 80
+local LASER_MAX_HEAT = Config.LaserMaxHeat or 100
 local RING_SYNC_INTERVAL = 0.35
 local lastRingSync = 0
 
 local espConnections = {}
-local tempVConnections = {}
 local chamsHighlights = {}
 local chamsPlayerSetup = {}
 local doorCollisionCache = {}
@@ -337,18 +364,162 @@ local function getScreenFovDist(worldPos)
     return (Vector2.new(sp.X, sp.Y) - center).Magnitude, true
 end
 
-local function canLaserNow()
-    local role = lplr:GetAttribute("Role") or ""
-    local tempV = lplr:GetAttribute("TempVPower") or ""
-    return role == "Homelander" or role == "Stormfront" or tempV == "LaserEyes"
+local function isStormfront()
+    return lplr:GetAttribute("Role") == Config.Role_Stormfront
 end
 
-local function getLaserAimPos(player)
-    local head = getAimPart(player, "Head")
-    if head then return head.Position end
-    local torso = getAimPart(player, "UpperTorso") or getAimPart(player, "Torso")
-    if torso then return torso.Position end
-    return nil
+local function isTempVLaser()
+    return lplr:GetAttribute("TempVPower") == "LaserEyes"
+end
+
+local function canLaserNow()
+    local role = lplr:GetAttribute("Role") or ""
+    return role == Config.Role_Homelander or role == Config.Role_Stormfront or isTempVLaser()
+end
+
+local function getLaserMaxHeat()
+    if isTempVLaser() then return TEMPV_MAX_HEAT end
+    return LASER_MAX_HEAT
+end
+
+local function getLaserMaxRange()
+    if isStormfront() then return LASER_MAX_RANGE end
+    if isTempVLaser() then return TEMPV_LASER_RANGE end
+    return LASER_MAX_RANGE
+end
+
+local function getCharHead()
+    local char = lplr.Character
+    return char and char:FindFirstChild("Head")
+end
+
+local function laserClientLOS(targetPart)
+    if wallTryMode then return true end
+    return hasLineOfSight(targetPart)
+end
+
+local function clampDirToServerCone(head, worldDir)
+    local look = head.CFrame.LookVector
+    local dot = look:Dot(worldDir)
+    if dot >= LASER_COS_ANGLE then return worldDir end
+    local perp = worldDir - look * dot
+    if perp.Magnitude < 0.001 then perp = head.CFrame.RightVector else perp = perp.Unit end
+    return (look * LASER_COS_ANGLE + perp * math.sin(math.rad(LASER_MAX_ANGLE))).Unit
+end
+
+local function clampAimToServerCone(head, desiredPos)
+    local offset = desiredPos - head.Position
+    if offset.Magnitude < 0.1 then return desiredPos end
+    if not serverConeFix or isStormfront() then return desiredPos end
+    local dir = offset.Unit
+    return head.Position + clampDirToServerCone(head, dir) * math.min(offset.Magnitude, getLaserMaxRange())
+end
+
+local function serverMirrorHitsPlayer(aimPos)
+    local head = getCharHead()
+    local char = lplr.Character
+    if not head or not char then return false, nil end
+    local offset = aimPos - head.Position
+    if offset.Magnitude < 0.1 then return false, nil end
+    local dir = offset.Unit
+    if not isStormfront() and head.CFrame.LookVector:Dot(dir) < LASER_COS_ANGLE then return false, nil end
+    if offset.Magnitude > getLaserMaxRange() * 1.2 then return false, nil end
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = { char }
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local hit = workspace:Raycast(head.Position, dir * math.min(offset.Magnitude + 5, getLaserMaxRange()), params)
+    if not hit or not hit.Instance then return false, nil end
+    local model = hit.Instance:FindFirstAncestorOfClass("Model")
+    local hum = model and model:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 or model == char then return false, nil end
+    return true, Players:GetPlayerFromCharacter(model)
+end
+
+local function getLaserTarget()
+    if laserLockTarget and tick() < laserLockUntil then
+        local part = getAimPart(laserLockTarget, "Head")
+        if part and isPlayerAlive(laserLockTarget) and laserClientLOS(part) then
+            return laserLockTarget, part
+        end
+        laserLockTarget = nil
+    end
+    local bestPlayer, bestPart, bestScore = nil, nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lplr and isPlayerAlive(p) then
+            local part = getAimPart(p, "Head")
+            if part then
+                local fovDist, onScreen = getScreenFovDist(part.Position)
+                if onScreen and fovDist and fovDist <= silentAimFov and laserClientLOS(part) then
+                    if fovDist < bestScore then
+                        bestScore = fovDist
+                        bestPlayer = p
+                        bestPart = part
+                    end
+                end
+            end
+        end
+    end
+    if bestPlayer then
+        laserLockTarget = bestPlayer
+        laserLockUntil = tick() + 0.3
+    end
+    return bestPlayer, bestPart
+end
+
+local function getCrosshairLaserTarget()
+    local unitRay = camera:ScreenPointToRay(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+    local params = RaycastParams.new()
+    local char = lplr.Character
+    if char then
+        params.FilterDescendantsInstances = { char }
+        params.FilterType = Enum.RaycastFilterType.Exclude
+    end
+    local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * getLaserMaxRange(), params)
+    if result and result.Instance then
+        local model = result.Instance:FindFirstAncestorOfClass("Model")
+        local p = model and Players:GetPlayerFromCharacter(model)
+        if p and p ~= lplr and isPlayerAlive(p) then
+            local part = getAimPart(p, aimPart)
+            if part and laserClientLOS(part) then return p, part end
+        end
+    end
+    return nil, nil
+end
+
+local function hideVanillaLasers()
+    pcall(function()
+        local LM = require(RS.Modules.LaserManager)
+        if LM.HideLasers then LM:HideLasers(lplr) end
+    end)
+end
+
+local function shouldForceLaserStop(targetPlayer, aimPos)
+    if not autoLaserStop then return false end
+    if not canLaserNow() then return true end
+    if lplr:GetAttribute("IsSuperVision") or lplr:GetAttribute("LaserOverheated") then return true end
+    local hum = lplr.Character and lplr.Character:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return true end
+    if preOverheatStop and (lplr:GetAttribute("LaserHeat") or 0) >= getLaserMaxHeat() * (preOverheatPercent / 100) then
+        return true
+    end
+    if not targetPlayer or not aimPos then
+        return tbLasering and tick() - lastHadTargetAt > LASER_GRACE
+    end
+    if not isPlayerAlive(targetPlayer) then return true end
+    if serverRaycastOnly then
+        local hit, hitPlr = serverMirrorHitsPlayer(aimPos)
+        if hit and (not hitPlr or hitPlr == targetPlayer) then
+            lastValidHitAt = tick()
+        elseif tbLasering and tick() - lastValidHitAt > LASER_GRACE then
+            return true
+        end
+    else
+        lastValidHitAt = tick()
+    end
+    if tbLasering and lplr:GetAttribute("IsLasering") ~= true and tick() - laserStartAt > 0.25 then
+        return true
+    end
+    return false
 end
 
 local function getBestCombatTarget(maxFov, requireAlive, partOverride)
@@ -391,42 +562,6 @@ local function getClosestPlayerToCrosshair()
     return part
 end
 
-local function getSilentLaserTarget()
-    if not silentAimEnabled then
-        return nil, nil
-    end
-    local p = select(1, getBestCombatTarget(silentAimFov, true, "Head"))
-    if p then
-        return p, getLaserAimPos(p)
-    end
-    return nil, nil
-end
-
-local function getPlayerUnderCrosshair()
-    local unitRay = camera:ScreenPointToRay(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
-    local params = RaycastParams.new()
-    local char = lplr.Character
-    if char then
-        params.FilterDescendantsInstances = { char }
-        params.FilterType = Enum.RaycastFilterType.Exclude
-    end
-    local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * 500, params)
-    if result and result.Instance then
-        local model = result.Instance:FindFirstAncestorOfClass("Model")
-        if model then
-            local p = Players:GetPlayerFromCharacter(model)
-            if p and p ~= lplr and isPlayerAlive(p) then
-                local hum = model:FindFirstChildOfClass("Humanoid")
-                local part = getAimPart(p, aimPart)
-                if hum and part and hasLineOfSight(part) then
-                    return p, getLaserAimPos(p) or result.Position
-                end
-            end
-        end
-    end
-    return nil, nil
-end
-
 local function getClosestPlayerInRange(range, useCrosshair)
     local char = lplr.Character
     if not char then return nil end
@@ -460,37 +595,44 @@ end
 local function stopLaser()
     if not tbLasering then return end
     tbLasering = false
+    laserLockTarget = nil
     Network:FireServer("LaserStop")
-    if lplr:GetAttribute("Role") == "Stormfront" then
-        Network:FireServer("StormElecStop")
-    end
+    if isStormfront() then Network:FireServer("StormElecStop") end
+    hideVanillaLasers()
 end
 
 local function runLaserCombat()
-    if not canLaserNow() then
+    if not canLaserNow() or not triggerbotEnabled then
         stopLaser()
         return
     end
 
-    if not triggerbotEnabled then
-        stopLaser()
-        return
-    end
-
-    local targetPlayer, aimPos
-
+    local targetPlayer, part
     if silentAimEnabled then
-        targetPlayer, aimPos = getSilentLaserTarget()
+        targetPlayer, part = getLaserTarget()
     else
-        targetPlayer, aimPos = getPlayerUnderCrosshair()
-        if targetPlayer then
-            aimPos = getLaserAimPos(targetPlayer) or aimPos
-        end
+        targetPlayer, part = getCrosshairLaserTarget()
+    end
+
+    local head = getCharHead()
+    local aimPos = (part and head) and clampAimToServerCone(head, part.Position) or nil
+
+    if shouldForceLaserStop(targetPlayer, aimPos) then
+        stopLaser()
+        return
     end
 
     if not targetPlayer or not aimPos then
-        stopLaser()
+        if tbLasering then stopLaser() end
         return
+    end
+
+    lastHadTargetAt = tick()
+    if alignCameraToTarget and part then
+        camera.CFrame = camera.CFrame:Lerp(
+            CFrame.new(camera.CFrame.Position, part.Position),
+            cameraAlignStrength
+        )
     end
 
     local now = tick()
@@ -499,10 +641,10 @@ local function runLaserCombat()
 
     if not tbLasering then
         tbLasering = true
+        lastValidHitAt = now
+        laserStartAt = now
         Network:FireServer("LaserStart")
-        if lplr:GetAttribute("Role") == "Stormfront" then
-            Network:FireServer("StormElecStart")
-        end
+        if isStormfront() then Network:FireServer("StormElecStart") end
     end
     Network:FireServer("LaserUpdate", aimPos)
 end
@@ -747,6 +889,11 @@ local function setChokeRangeEnabled(on)
 end
 
 lplr.CharacterAdded:Connect(function()
+    tbLasering = false
+    laserLockTarget = nil
+    lastValidHitAt = 0
+    lastHadTargetAt = 0
+    laserStartAt = 0
     if chokeRangeEnabled then
         task.defer(syncChokeRings)
     end
@@ -828,124 +975,6 @@ local function setupChamsPlayer(player)
     if player.Character and chamsEnabled then
         addChams(player)
     end
-end
-
--- ========== TEMPV ESP ==========
-local TEMPV_COLOR = Color3.fromRGB(120, 200, 90)
-
-local function createTempVBoxESP(model)
-    local HeadOff = Vector3.new(0, 0.5, 0)
-    local LegOff  = Vector3.new(0, 1.5, 0)
-    local widthScale = 1.4
-
-    local BoxOutline = Drawing.new("Square")
-    BoxOutline.Visible = false; BoxOutline.Color = Color3.new(0,0,0)
-    BoxOutline.Thickness = 2; BoxOutline.Transparency = 1; BoxOutline.Filled = false
-
-    local Box = Drawing.new("Square")
-    Box.Visible = false; Box.Color = TEMPV_COLOR
-    Box.Thickness = 1; Box.Transparency = 1; Box.Filled = false
-
-    local LabelOutline = Drawing.new("Text")
-    LabelOutline.Visible = false; LabelOutline.Color = Color3.new(0,0,0)
-    LabelOutline.Size = 12; LabelOutline.Font = 2; LabelOutline.Outline = true; LabelOutline.Center = true
-
-    local Label = Drawing.new("Text")
-    Label.Visible = false; Label.Color = TEMPV_COLOR
-    Label.Size = 12; Label.Font = 2; Label.Outline = false; Label.Center = true
-
-    local conn = RunService.RenderStepped:Connect(function()
-        if not model or not model.Parent then
-            Box.Visible = false; BoxOutline.Visible = false
-            Label.Visible = false; LabelOutline.Visible = false
-            return
-        end
-        if not tempVEspEnabled then
-            Box.Visible = false; BoxOutline.Visible = false
-            Label.Visible = false; LabelOutline.Visible = false
-            return
-        end
-        local part = model.PrimaryPart or model:FindFirstChildOfClass("BasePart")
-        if not part then
-            Box.Visible = false; BoxOutline.Visible = false
-            Label.Visible = false; LabelOutline.Visible = false
-            return
-        end
-        local localRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
-        local RootPos, onScreen = camera:WorldToViewportPoint(part.Position)
-        local HeadPos = camera:WorldToViewportPoint(part.Position + HeadOff)
-        local LegPos  = camera:WorldToViewportPoint(part.Position - LegOff)
-
-        if onScreen then
-            local boxWidth  = (1000 / RootPos.Z) * widthScale
-            local boxHeight = math.abs(HeadPos.Y - LegPos.Y)
-            local boxX = RootPos.X - boxWidth / 2
-            local boxY = math.min(HeadPos.Y, LegPos.Y)
-
-            BoxOutline.Size = Vector2.new(boxWidth + 2, boxHeight + 2)
-            BoxOutline.Position = Vector2.new(boxX - 1, boxY - 1)
-            BoxOutline.Visible = true
-
-            Box.Size = Vector2.new(boxWidth, boxHeight)
-            Box.Position = Vector2.new(boxX, boxY)
-            Box.Visible = true
-
-            local dist = localRoot and math.round((part.Position - localRoot.Position).Magnitude) or 0
-            local txt = "TempV [" .. dist .. "m]"
-            Label.Text = txt; Label.Position = Vector2.new(RootPos.X, boxY - 16); Label.Visible = true
-            LabelOutline.Text = txt; LabelOutline.Position = Vector2.new(RootPos.X, boxY - 16); LabelOutline.Visible = true
-        else
-            Box.Visible = false; BoxOutline.Visible = false
-            Label.Visible = false; LabelOutline.Visible = false
-        end
-    end)
-
-    local entry = {connection = conn, box = Box, outline = BoxOutline, label = Label, labelOutline = LabelOutline, model = model}
-    table.insert(tempVConnections, entry)
-
-    model.AncestryChanged:Connect(function()
-        if not model.Parent then
-            conn:Disconnect()
-            Box:Remove(); BoxOutline:Remove(); Label:Remove(); LabelOutline:Remove()
-            for i, v in ipairs(tempVConnections) do
-                if v.model == model then table.remove(tempVConnections, i); break end
-            end
-        end
-    end)
-end
-
-local function clearTempVESP()
-    for _, v in ipairs(tempVConnections) do
-        if v.connection then v.connection:Disconnect() end
-        if v.box then v.box:Remove() end
-        if v.outline then v.outline:Remove() end
-        if v.label then v.label:Remove() end
-        if v.labelOutline then v.labelOutline:Remove() end
-    end
-    tempVConnections = {}
-end
-
-local workspaceChildAddedConn = nil
-
-local function startTempVWatcher()
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Model") and obj.Name == "TempV" then
-            createTempVBoxESP(obj)
-        end
-    end
-    workspaceChildAddedConn = workspace.ChildAdded:Connect(function(obj)
-        if tempVEspEnabled and obj:IsA("Model") and obj.Name == "TempV" then
-            createTempVBoxESP(obj)
-        end
-    end)
-end
-
-local function stopTempVWatcher()
-    if workspaceChildAddedConn then
-        workspaceChildAddedConn:Disconnect()
-        workspaceChildAddedConn = nil
-    end
-    clearTempVESP()
 end
 
 -- ========== MAIN HEARTBEAT ==========
@@ -1180,12 +1209,7 @@ chamSec:ToggleKeyBind("Chams", Enum.KeyCode.F2, function(on)
     end
 end)
 
-local worldSec = visualsTab:Section("World")
-worldSec:ToggleKeyBind("TempV ESP", Enum.KeyCode.F3, function(on)
-    tempVEspEnabled = on
-    if on then startTempVWatcher() else stopTempVWatcher() end
-end)
-worldSec:ToggleKeyBind("Choke Range", Enum.KeyCode.F4, function(on)
+visualsTab:Section("World"):ToggleKeyBind("Choke Range", Enum.KeyCode.F4, function(on)
     setChokeRangeEnabled(on)
 end)
 
@@ -1228,21 +1252,28 @@ speedSec:Slider("Sprint Speed", 16, 100, function(val)
 end)
 
 -- Combat
-local aimSec = combatTab:Section("Aim")
-aimSec:ToggleKeyBind("Silent Aim", Enum.KeyCode.V, function(on) silentAimEnabled = on end)
-aimSec:Slider("Silent FOV", 80, 500, function(val) silentAimFov = val end)
-aimSec:ToggleKeyBind("Aim Assist", Enum.KeyCode.X, function(on) aimEnabled = on end)
-aimSec:Slider("Aim Smoothing", 1, 100, function(val) aimSmoothing = val / 100 end)
-aimSec:DropDown("Aim Part", {"Head", "Torso", "HumanoidRootPart"}, function(val) aimPart = val end)
-
 local laserSec = combatTab:Section("Laser")
 laserSec:ToggleKeyBind("Triggerbot", Enum.KeyCode.Z, function(on)
     triggerbotEnabled = on
     if not on then stopLaser() end
 end)
+laserSec:ToggleKeyBind("Silent Aim", Enum.KeyCode.V, function(on) silentAimEnabled = on end)
+laserSec:Slider("Silent FOV", 80, 500, function(val) silentAimFov = val end)
+laserSec:DropDown("Aim Part", {"Head", "Torso", "HumanoidRootPart"}, function(val) aimPart = val end)
+laserSec:Toggle("Server cone fix", function(on) serverConeFix = on end)
+laserSec:Toggle("Server raycast check", function(on) serverRaycastOnly = on end)
+laserSec:Toggle("Wall try", function(on) wallTryMode = on end)
+laserSec:Toggle("Align camera", function(on) alignCameraToTarget = on end)
+laserSec:Slider("Camera align %", 1, 40, function(val) cameraAlignStrength = val / 100 end)
+laserSec:Toggle("Auto LaserStop", function(on) autoLaserStop = on end)
+laserSec:Toggle("Stop before overheat", function(on) preOverheatStop = on end)
+laserSec:Slider("Heat stop %", 50, 99, function(val) preOverheatPercent = val end)
 
-local hlSec = combatTab:Section("Homelander")
-hlSec:ToggleKeyBind("Auto Choke", Enum.KeyCode.C, function(on) autoChokeEnabled = on end)
+local aimSec = combatTab:Section("Aim Assist")
+aimSec:ToggleKeyBind("Aim Assist", Enum.KeyCode.X, function(on) aimEnabled = on end)
+aimSec:Slider("Smoothing", 1, 100, function(val) aimSmoothing = val / 100 end)
+
+combatTab:Section("Homelander"):ToggleKeyBind("Auto Choke", Enum.KeyCode.C, function(on) autoChokeEnabled = on end)
 
 -- Utility
 local survSec = utilityTab:Section("Survivor")
@@ -1268,8 +1299,7 @@ streamSec:ToggleKeyBind("Stream Spoof", Enum.KeyCode.P, function(on)
     if on then startStreamSpoof() else stopStreamSpoof() end
 end)
 
--- Credits
-creditsTab:Section("Main"):Credit("untern v2 — Survive Homelander")
-creditsTab:Section("UI"):Credit("Cyanogen / Wisteria GUI")
+creditsTab:Section("Credits"):Credit("untern v2 — cyano-hub")
 
 Luxt:SetTheme("Grey")
+print("[Cyanogen] Loaded — one file, all tabs")
