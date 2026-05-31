@@ -1,11 +1,10 @@
 --[[
-  Loader — одна строка в executor вместо двух файлов.
+  Loader — одна строка в executor.
 
-  Репозиторий: https://github.com/usersibo/cyanogen
-  Важно: имена файлов на GitHub с БОЛЬШОЙ буквы — Cyanogen.lua, LaserPlus.lua
+  Репозиторий: https://github.com/usersibo/cyano-hub
 ]]
 
-local BASE = "https://raw.githubusercontent.com/usersibo/cyanogen/main/"
+local BASE = "https://raw.githubusercontent.com/usersibo/cyano-hub/refs/heads/main/"
 
 local function loadUrl(path)
     local url = BASE .. path
@@ -26,4 +25,4 @@ loadUrl("Cyanogen.lua")
 task.wait(0.3)
 loadUrl("LaserPlus.lua")
 
-print("[Cyanogen Loader] Cyanogen + LaserPlus loaded from GitHub")
+print("[Cyanogen Loader] Cyanogen + LaserPlus loaded from cyano-hub")
