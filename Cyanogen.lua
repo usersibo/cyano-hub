@@ -100,6 +100,9 @@ local invisVisionEnabled = false
 local noDoorCollision = false
 local streamSpoofEnabled = false
 local chokeRangeEnabled = false
+local autoTempVEnabled = false
+local lastTempVTick = 0
+local TEMPV_GRAB_COOLDOWN = 1.25
 
 local silentAimEnabled = true
 local silentAimFov = 280
@@ -132,6 +135,10 @@ local RING_SYNC_INTERVAL = 0.35
 local lastRingSync = 0
 
 local espConnections = {}
+local tempVEspEnabled = false
+local tempVConnections = {}
+local workspaceTempVConn = nil
+local TEMPV_ESP_COLOR = Color3.fromRGB(95, 165, 72)
 local chamsHighlights = {}
 local chamsPlayerSetup = {}
 local doorCollisionCache = {}
@@ -784,6 +791,116 @@ local function stopStreamSpoof()
     UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 end
 
+-- ========== AUTO TEMPV ==========
+local function getTempVRoot(obj)
+    if not obj or not obj.Parent then return nil end
+    if obj:IsA("BasePart") then return obj end
+    if obj:IsA("Model") then
+        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return nil
+end
+
+local function findTempVPrompt(obj)
+    if not obj then return nil end
+    local root = getTempVRoot(obj)
+    if root then
+        local p = root:FindFirstChildOfClass("ProximityPrompt")
+        if p then return p end
+    end
+    for _, d in ipairs(obj:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then return d end
+    end
+    return nil
+end
+
+local function canGrabTempV()
+    if lplr:GetAttribute("TempVPower") then return false end
+    if lplr:GetAttribute("Role") ~= Config.Role_Hider then return false end
+    if lplr:GetAttribute("Role") == Config.Role_Homelander or lplr:GetAttribute("Role") == Config.Role_Stormfront then
+        return false
+    end
+    local char = lplr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return char and hum and hum.Health > 0 and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getNearestTempV()
+    local hrp = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local nearest, bestDist = nil, math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "TempV" and (obj:IsA("Model") or obj:IsA("BasePart")) then
+            local root = getTempVRoot(obj)
+            if root then
+                local dist = (root.Position - hrp.Position).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    nearest = obj
+                end
+            end
+        end
+    end
+    return nearest, bestDist
+end
+
+local function triggerTempVPrompt(prompt)
+    if not prompt or not prompt.Parent then return false end
+    local oldHold = prompt.HoldDuration
+    local oldDist = prompt.MaxActivationDistance
+    prompt.HoldDuration = 0
+    prompt.MaxActivationDistance = 999
+    prompt.RequiresLineOfSight = false
+    prompt.Enabled = true
+
+    local ok = false
+    if typeof(fireproximityprompt) == "function" then
+        ok = pcall(function() fireproximityprompt(prompt, 0) end)
+    end
+    if not ok then
+        ok = pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(0.06)
+            prompt:InputHoldEnd()
+        end)
+    end
+
+    prompt.HoldDuration = oldHold
+    prompt.MaxActivationDistance = oldDist
+    return ok
+end
+
+local function grabTempV(obj)
+    if not canGrabTempV() or not obj or not obj.Parent then return false end
+
+    local root = getTempVRoot(obj)
+    local hrp = lplr.Character:FindFirstChild("HumanoidRootPart")
+    if not root or not hrp then return false end
+
+    local prompt = findTempVPrompt(obj)
+    if not prompt then return false end
+
+    hrp.CFrame = root.CFrame + Vector3.new(0, 2.5, 0)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    task.wait(0.05)
+
+    return triggerTempVPrompt(prompt)
+end
+
+local function tryAutoTempV()
+    if not autoTempVEnabled then return end
+    if not canGrabTempV() then return end
+    local now = tick()
+    if now - lastTempVTick < TEMPV_GRAB_COOLDOWN then return end
+
+    local nearest = getNearestTempV()
+    if not nearest then return end
+
+    lastTempVTick = now
+    grabTempV(nearest)
+end
+
 -- ========== CHOKE RANGE (Part + Highlight) ==========
 local function ringFillColor(inChoke, isLocal)
     if isLocal then return Color3.fromRGB(95, 8, 12) end
@@ -1068,6 +1185,8 @@ RunService.Heartbeat:Connect(function()
         lastRingSync = tick()
         syncChokeRings()
     end
+
+    tryAutoTempV()
 end)
 
 -- ========== COMBAT LOOP (RenderStepped) ==========
@@ -1091,6 +1210,155 @@ Players.PlayerRemoving:Connect(function(player)
     end
     removeChams(player)
 end)
+
+-- ========== TEMPV ESP ==========
+local function clearTempVESP()
+    for _, v in ipairs(tempVConnections) do
+        if v.connection then v.connection:Disconnect() end
+        if v.box then v.box:Remove() end
+        if v.outline then v.outline:Remove() end
+        if v.label then v.label:Remove() end
+        if v.labelOutline then v.labelOutline:Remove() end
+    end
+    tempVConnections = {}
+end
+
+local function createTempVBoxESP(model)
+    local HeadOff = Vector3.new(0, 0.5, 0)
+    local LegOff = Vector3.new(0, 1.5, 0)
+    local widthScale = 1.4
+
+    local BoxOutline = Drawing.new("Square")
+    BoxOutline.Visible = false
+    BoxOutline.Color = Color3.new(0, 0, 0)
+    BoxOutline.Thickness = 2
+    BoxOutline.Transparency = 1
+    BoxOutline.Filled = false
+
+    local Box = Drawing.new("Square")
+    Box.Visible = false
+    Box.Color = TEMPV_ESP_COLOR
+    Box.Thickness = 1
+    Box.Transparency = 1
+    Box.Filled = false
+
+    local LabelOutline = Drawing.new("Text")
+    LabelOutline.Visible = false
+    LabelOutline.Color = Color3.new(0, 0, 0)
+    LabelOutline.Size = 12
+    LabelOutline.Font = 2
+    LabelOutline.Outline = true
+    LabelOutline.Center = true
+
+    local Label = Drawing.new("Text")
+    Label.Visible = false
+    Label.Color = TEMPV_ESP_COLOR
+    Label.Size = 12
+    Label.Font = 2
+    Label.Outline = false
+    Label.Center = true
+
+    local connection = RunService.RenderStepped:Connect(function()
+        if not tempVEspEnabled or not model or not model.Parent then
+            Box.Visible = false
+            BoxOutline.Visible = false
+            Label.Visible = false
+            LabelOutline.Visible = false
+            return
+        end
+
+        local part = model:IsA("BasePart") and model or (model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart"))
+        if not part then
+            Box.Visible = false
+            BoxOutline.Visible = false
+            Label.Visible = false
+            LabelOutline.Visible = false
+            return
+        end
+
+        local localRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+        local RootPos, onScreen = camera:WorldToViewportPoint(part.Position)
+        local HeadPos = camera:WorldToViewportPoint(part.Position + HeadOff)
+        local LegPos = camera:WorldToViewportPoint(part.Position - LegOff)
+
+        if onScreen then
+            local boxWidth = (1000 / RootPos.Z) * widthScale
+            local boxHeight = math.abs(HeadPos.Y - LegPos.Y)
+            local boxX = RootPos.X - boxWidth / 2
+            local boxY = math.min(HeadPos.Y, LegPos.Y)
+
+            BoxOutline.Size = Vector2.new(boxWidth + 2, boxHeight + 2)
+            BoxOutline.Position = Vector2.new(boxX - 1, boxY - 1)
+            BoxOutline.Visible = true
+
+            Box.Size = Vector2.new(boxWidth, boxHeight)
+            Box.Position = Vector2.new(boxX, boxY)
+            Box.Visible = true
+
+            local dist = localRoot and math.round((part.Position - localRoot.Position).Magnitude) or 0
+            local txt = "TempV [" .. dist .. "m]"
+            Label.Text = txt
+            Label.Position = Vector2.new(RootPos.X, boxY - 16)
+            Label.Visible = true
+            LabelOutline.Text = txt
+            LabelOutline.Position = Vector2.new(RootPos.X, boxY - 16)
+            LabelOutline.Visible = true
+        else
+            Box.Visible = false
+            BoxOutline.Visible = false
+            Label.Visible = false
+            LabelOutline.Visible = false
+        end
+    end)
+
+    table.insert(tempVConnections, {
+        connection = connection,
+        box = Box,
+        outline = BoxOutline,
+        label = Label,
+        labelOutline = LabelOutline,
+        model = model,
+    })
+
+    model.AncestryChanged:Connect(function()
+        if not model.Parent then
+            connection:Disconnect()
+            Box:Remove()
+            BoxOutline:Remove()
+            Label:Remove()
+            LabelOutline:Remove()
+            for i, v in ipairs(tempVConnections) do
+                if v.model == model then
+                    table.remove(tempVConnections, i)
+                    break
+                end
+            end
+        end
+    end)
+end
+
+local function startTempVWatcher()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "TempV" and (obj:IsA("Model") or obj:IsA("BasePart")) then
+            createTempVBoxESP(obj)
+        end
+    end
+    if workspaceTempVConn then workspaceTempVConn:Disconnect() end
+    workspaceTempVConn = workspace.ChildAdded:Connect(function(obj)
+        if not tempVEspEnabled then return end
+        if obj.Name == "TempV" and (obj:IsA("Model") or obj:IsA("BasePart")) then
+            task.defer(createTempVBoxESP, obj)
+        end
+    end)
+end
+
+local function stopTempVWatcher()
+    if workspaceTempVConn then
+        workspaceTempVConn:Disconnect()
+        workspaceTempVConn = nil
+    end
+    clearTempVESP()
+end
 
 -- ========== PLAYER ESP ==========
 local function createBoxESP(player)
@@ -1209,7 +1477,12 @@ chamSec:ToggleKeyBind("Chams", Enum.KeyCode.F2, function(on)
     end
 end)
 
-visualsTab:Section("World"):ToggleKeyBind("Choke Range", Enum.KeyCode.F4, function(on)
+local worldSec = visualsTab:Section("World")
+worldSec:ToggleKeyBind("TempV ESP", Enum.KeyCode.F3, function(on)
+    tempVEspEnabled = on
+    if on then startTempVWatcher() else stopTempVWatcher() end
+end)
+worldSec:ToggleKeyBind("Choke Range", Enum.KeyCode.F4, function(on)
     setChokeRangeEnabled(on)
 end)
 
@@ -1291,6 +1564,13 @@ end)
 survSec:ToggleKeyBind("No Door Collision", Enum.KeyCode.U, function(on)
     noDoorCollision = on
     applyDoorCollision(on)
+end)
+
+local tempvSec = utilityTab:Section("TempV")
+tempvSec:ToggleKeyBind("Auto TempV", Enum.KeyCode.Semicolon, function(on) autoTempVEnabled = on end)
+tempvSec:Button("Grab Nearest TempV", function()
+    local obj = getNearestTempV()
+    if obj then grabTempV(obj) end
 end)
 
 local streamSec = utilityTab:Section("Stream")
