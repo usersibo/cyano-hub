@@ -109,17 +109,20 @@ local silentAimFov = 280
 local laserLockTarget = nil
 local laserLockUntil = 0
 local lastLaserNetTick = 0
-local serverConeFix = true
-local serverRaycastOnly = true
-local wallTryMode = false
-local alignCameraToTarget = true
+local showLaserRay = true
 local autoLaserStop = true
 local preOverheatStop = true
 local preOverheatPercent = 88
-local cameraAlignStrength = 0.12
-local lastValidHitAt = 0
 local lastHadTargetAt = 0
-local laserStartAt = 0
+local lastLaserAimValid = false
+
+local laserRayLine = Drawing.new("Line")
+laserRayLine.Thickness = 2.5
+laserRayLine.Visible = false
+local crossRayLine = Drawing.new("Line")
+crossRayLine.Thickness = 1.5
+crossRayLine.Color = Color3.fromRGB(150, 150, 170)
+crossRayLine.Visible = false
 
 local CHOKE_RANGE = 13
 local RING_SIZE = CHOKE_RANGE * 2
@@ -358,7 +361,13 @@ end
 local function getAimPart(player, partName)
     local char = player and player.Character
     if not char then return nil end
-    return char:FindFirstChild(partName or aimPart)
+    local name = partName or aimPart
+    if name == "Torso" then
+        return char:FindFirstChild("UpperTorso")
+            or char:FindFirstChild("LowerTorso")
+            or char:FindFirstChild("Torso")
+    end
+    return char:FindFirstChild(name)
         or char:FindFirstChild("Head")
         or char:FindFirstChild("UpperTorso")
         or char:FindFirstChild("HumanoidRootPart")
@@ -400,11 +409,6 @@ local function getCharHead()
     return char and char:FindFirstChild("Head")
 end
 
-local function laserClientLOS(targetPart)
-    if wallTryMode then return true end
-    return hasLineOfSight(targetPart)
-end
-
 local function clampDirToServerCone(head, worldDir)
     local look = head.CFrame.LookVector
     local dot = look:Dot(worldDir)
@@ -414,38 +418,49 @@ local function clampDirToServerCone(head, worldDir)
     return (look * LASER_COS_ANGLE + perp * math.sin(math.rad(LASER_MAX_ANGLE))).Unit
 end
 
-local function clampAimToServerCone(head, desiredPos)
-    local offset = desiredPos - head.Position
-    if offset.Magnitude < 0.1 then return desiredPos end
-    if not serverConeFix or isStormfront() then return desiredPos end
-    local dir = offset.Unit
-    return head.Position + clampDirToServerCone(head, dir) * math.min(offset.Magnitude, getLaserMaxRange())
-end
-
-local function serverMirrorHitsPlayer(aimPos)
-    local head = getCharHead()
+local function computeLaserAimPoint(head, targetPart)
+    if not head or not targetPart then return nil, false end
     local char = lplr.Character
-    if not head or not char then return false, nil end
-    local offset = aimPos - head.Position
-    if offset.Magnitude < 0.1 then return false, nil end
-    local dir = offset.Unit
-    if not isStormfront() and head.CFrame.LookVector:Dot(dir) < LASER_COS_ANGLE then return false, nil end
-    if offset.Magnitude > getLaserMaxRange() * 1.2 then return false, nil end
+    local desired = targetPart.Position
+    local offset = desired - head.Position
+    if offset.Magnitude < 0.1 then return desired, true end
+
     local params = RaycastParams.new()
-    params.FilterDescendantsInstances = { char }
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    local hit = workspace:Raycast(head.Position, dir * math.min(offset.Magnitude + 5, getLaserMaxRange()), params)
-    if not hit or not hit.Instance then return false, nil end
-    local model = hit.Instance:FindFirstAncestorOfClass("Model")
-    local hum = model and model:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 or model == char then return false, nil end
-    return true, Players:GetPlayerFromCharacter(model)
+    if char then
+        params.FilterDescendantsInstances = { char }
+        params.FilterType = Enum.RaycastFilterType.Exclude
+    end
+    local maxR = getLaserMaxRange()
+    local targetModel = targetPart.Parent
+
+    if isStormfront() then
+        local hit = workspace:Raycast(head.Position, offset.Unit * maxR, params)
+        if hit then
+            local model = hit.Instance:FindFirstAncestorOfClass("Model")
+            if model == targetModel then return hit.Position, true end
+        end
+        return desired, false
+    end
+
+    local dir = offset.Unit
+    if head.CFrame.LookVector:Dot(dir) < LASER_COS_ANGLE then
+        dir = clampDirToServerCone(head, dir)
+    end
+
+    local hit = workspace:Raycast(head.Position, dir * maxR, params)
+    if hit then
+        local model = hit.Instance:FindFirstAncestorOfClass("Model")
+        if model == targetModel then return hit.Position, true end
+    end
+
+    local fallback = head.Position + dir * math.min(offset.Magnitude, maxR)
+    return fallback, false
 end
 
 local function getLaserTarget()
     if laserLockTarget and tick() < laserLockUntil then
-        local part = getAimPart(laserLockTarget, "Head")
-        if part and isPlayerAlive(laserLockTarget) and laserClientLOS(part) then
+        local part = getAimPart(laserLockTarget, aimPart)
+        if part and isPlayerAlive(laserLockTarget) and hasLineOfSight(part) then
             return laserLockTarget, part
         end
         laserLockTarget = nil
@@ -453,10 +468,10 @@ local function getLaserTarget()
     local bestPlayer, bestPart, bestScore = nil, nil, math.huge
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= lplr and isPlayerAlive(p) then
-            local part = getAimPart(p, "Head")
+            local part = getAimPart(p, aimPart)
             if part then
                 local fovDist, onScreen = getScreenFovDist(part.Position)
-                if onScreen and fovDist and fovDist <= silentAimFov and laserClientLOS(part) then
+                if onScreen and fovDist and fovDist <= silentAimFov and hasLineOfSight(part) then
                     if fovDist < bestScore then
                         bestScore = fovDist
                         bestPlayer = p
@@ -487,7 +502,7 @@ local function getCrosshairLaserTarget()
         local p = model and Players:GetPlayerFromCharacter(model)
         if p and p ~= lplr and isPlayerAlive(p) then
             local part = getAimPart(p, aimPart)
-            if part and laserClientLOS(part) then return p, part end
+            if part and hasLineOfSight(part) then return p, part end
         end
     end
     return nil, nil
@@ -513,20 +528,77 @@ local function shouldForceLaserStop(targetPlayer, aimPos)
         return tbLasering and tick() - lastHadTargetAt > LASER_GRACE
     end
     if not isPlayerAlive(targetPlayer) then return true end
-    if serverRaycastOnly then
-        local hit, hitPlr = serverMirrorHitsPlayer(aimPos)
-        if hit and (not hitPlr or hitPlr == targetPlayer) then
-            lastValidHitAt = tick()
-        elseif tbLasering and tick() - lastValidHitAt > LASER_GRACE then
-            return true
+    return false
+end
+
+local function worldSegmentToScreen(a, b)
+    local p1, on1 = camera:WorldToViewportPoint(a)
+    local p2, on2 = camera:WorldToViewportPoint(b)
+    if not on1 or not on2 or p1.Z <= 0 or p2.Z <= 0 then return false end
+    return true, Vector2.new(p1.X, p1.Y), Vector2.new(p2.X, p2.Y)
+end
+
+local function updateLaserVisuals(head, aimPos)
+    if not showLaserRay or not head then
+        laserRayLine.Visible = false
+        crossRayLine.Visible = false
+        return
+    end
+    if aimPos then
+        local ok, from, to = worldSegmentToScreen(head.Position, aimPos)
+        if ok then
+            laserRayLine.From = from
+            laserRayLine.To = to
+            laserRayLine.Color = lastLaserAimValid and Color3.fromRGB(72, 255, 120) or Color3.fromRGB(255, 72, 72)
+            laserRayLine.Visible = true
+        else
+            laserRayLine.Visible = false
         end
     else
-        lastValidHitAt = tick()
+        laserRayLine.Visible = false
     end
-    if tbLasering and lplr:GetAttribute("IsLasering") ~= true and tick() - laserStartAt > 0.25 then
-        return true
+    local unitRay = camera:ScreenPointToRay(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+    local params = RaycastParams.new()
+    local char = lplr.Character
+    if char then
+        params.FilterDescendantsInstances = { char }
+        params.FilterType = Enum.RaycastFilterType.Exclude
     end
-    return false
+    local maxR = getLaserMaxRange()
+    local hit = workspace:Raycast(unitRay.Origin, unitRay.Direction * maxR, params)
+    local endPos = hit and hit.Position or (unitRay.Origin + unitRay.Direction * maxR)
+    local okCross, cFrom, cTo = worldSegmentToScreen(head.Position, endPos)
+    if okCross then
+        crossRayLine.From = cFrom
+        crossRayLine.To = cTo
+        crossRayLine.Visible = true
+    else
+        crossRayLine.Visible = false
+    end
+end
+
+local function drawGameLaserFX(head, aimPos)
+    if not tbLasering or not head or not aimPos then return end
+    pcall(function()
+        local LM = require(RS.Modules.LaserManager)
+        if not LM.DrawLasers then return end
+        local offset = aimPos - head.Position
+        if offset.Magnitude < 0.1 then return end
+        local params = RaycastParams.new()
+        local char = lplr.Character
+        if char then
+            params.FilterDescendantsInstances = { char }
+            params.FilterType = Enum.RaycastFilterType.Exclude
+        end
+        local hit = workspace:Raycast(head.Position, offset.Unit * getLaserMaxRange(), params)
+        LM:DrawLasers(
+            lplr,
+            aimPos,
+            hit and hit.Instance or nil,
+            hit and hit.Normal or Vector3.new(0, 1, 0),
+            hit and hit.Material or Enum.Material.SmoothPlastic
+        )
+    end)
 end
 
 local function getBestCombatTarget(maxFov, requireAlive, partOverride)
@@ -622,7 +694,12 @@ local function runLaserCombat()
     end
 
     local head = getCharHead()
-    local aimPos = (part and head) and clampAimToServerCone(head, part.Position) or nil
+    local aimPos, aimValid = nil, false
+    if part and head then
+        aimPos, aimValid = computeLaserAimPoint(head, part)
+    end
+    lastLaserAimValid = aimValid
+    updateLaserVisuals(head, aimPos)
 
     if shouldForceLaserStop(targetPlayer, aimPos) then
         stopLaser()
@@ -635,12 +712,6 @@ local function runLaserCombat()
     end
 
     lastHadTargetAt = tick()
-    if alignCameraToTarget and part then
-        camera.CFrame = camera.CFrame:Lerp(
-            CFrame.new(camera.CFrame.Position, part.Position),
-            cameraAlignStrength
-        )
-    end
 
     local now = tick()
     if now - lastLaserNetTick < LASER_TICK then return end
@@ -648,12 +719,11 @@ local function runLaserCombat()
 
     if not tbLasering then
         tbLasering = true
-        lastValidHitAt = now
-        laserStartAt = now
         Network:FireServer("LaserStart")
         if isStormfront() then Network:FireServer("StormElecStart") end
     end
     Network:FireServer("LaserUpdate", aimPos)
+    drawGameLaserFX(head, aimPos)
 end
 
 -- ========== NO DOOR COLLISION ==========
@@ -1008,9 +1078,7 @@ end
 lplr.CharacterAdded:Connect(function()
     tbLasering = false
     laserLockTarget = nil
-    lastValidHitAt = 0
     lastHadTargetAt = 0
-    laserStartAt = 0
     if chokeRangeEnabled then
         task.defer(syncChokeRings)
     end
@@ -1191,16 +1259,23 @@ end)
 
 -- ========== COMBAT LOOP (RenderStepped) ==========
 RunService.RenderStepped:Connect(function()
-    if aimEnabled and not silentAimEnabled then
-        local target = getClosestPlayerToCrosshair()
-        if target then
-            local fovDist = select(1, getScreenFovDist(target.Position))
+    if aimEnabled then
+        local targetPart = getClosestPlayerToCrosshair()
+        if targetPart then
+            local fovDist = select(1, getScreenFovDist(targetPart.Position))
             if fovDist and fovDist <= silentAimFov then
-                camera.CFrame = camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position, target.Position), aimSmoothing)
+                camera.CFrame = camera.CFrame:Lerp(
+                    CFrame.new(camera.CFrame.Position, targetPart.Position),
+                    aimSmoothing
+                )
             end
         end
     end
     runLaserCombat()
+    if not triggerbotEnabled or not showLaserRay then
+        laserRayLine.Visible = false
+        crossRayLine.Visible = false
+    end
 end)
 
 Players.PlayerRemoving:Connect(function(player)
@@ -1525,28 +1600,29 @@ speedSec:Slider("Sprint Speed", 16, 100, function(val)
 end)
 
 -- Combat
-local laserSec = combatTab:Section("Laser")
+local laserSec = combatTab:Section("Laser (Homelander / Storm / TempV)")
+laserSec:Credit("Z = auto fire. V = aim in FOV without crosshair on body.")
 laserSec:ToggleKeyBind("Triggerbot", Enum.KeyCode.Z, function(on)
     triggerbotEnabled = on
     if not on then stopLaser() end
 end)
 laserSec:ToggleKeyBind("Silent Aim", Enum.KeyCode.V, function(on) silentAimEnabled = on end)
-laserSec:Slider("Silent FOV", 80, 500, function(val) silentAimFov = val end)
-laserSec:DropDown("Aim Part", {"Head", "Torso", "HumanoidRootPart"}, function(val) aimPart = val end)
-laserSec:Toggle("Server cone fix", function(on) serverConeFix = on end)
-laserSec:Toggle("Server raycast check", function(on) serverRaycastOnly = on end)
-laserSec:Toggle("Wall try", function(on) wallTryMode = on end)
-laserSec:Toggle("Align camera", function(on) alignCameraToTarget = on end)
-laserSec:Slider("Camera align %", 1, 40, function(val) cameraAlignStrength = val / 100 end)
-laserSec:Toggle("Auto LaserStop", function(on) autoLaserStop = on end)
+laserSec:Slider("Combat FOV", 80, 500, function(val) silentAimFov = val end)
+laserSec:DropDown("Target part", {"Head", "Torso", "HumanoidRootPart"}, function(val) aimPart = val end)
+laserSec:Toggle("Show aim lines", function(on) showLaserRay = on end)
+laserSec:Credit("Green = server can hit target. Red = wall or head turned away.")
+laserSec:Toggle("Auto stop (no target)", function(on) autoLaserStop = on end)
 laserSec:Toggle("Stop before overheat", function(on) preOverheatStop = on end)
 laserSec:Slider("Heat stop %", 50, 99, function(val) preOverheatPercent = val end)
 
-local aimSec = combatTab:Section("Aim Assist")
+local aimSec = combatTab:Section("Aim Assist (camera only)")
+aimSec:Credit("Does not fire. Use with Silent Aim so laser registers.")
 aimSec:ToggleKeyBind("Aim Assist", Enum.KeyCode.X, function(on) aimEnabled = on end)
 aimSec:Slider("Smoothing", 1, 100, function(val) aimSmoothing = val / 100 end)
 
-combatTab:Section("Homelander"):ToggleKeyBind("Auto Choke", Enum.KeyCode.C, function(on) autoChokeEnabled = on end)
+local hlSec = combatTab:Section("Homelander")
+hlSec:ToggleKeyBind("Auto Choke", Enum.KeyCode.C, function(on) autoChokeEnabled = on end)
+hlSec:Credit("Choke range ring: Visuals tab, F4.")
 
 -- Utility
 local survSec = utilityTab:Section("Survivor")
