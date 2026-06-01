@@ -93,7 +93,10 @@ local aimPart = "Head"
 local tbLasering = false
 
 local autoChokeEnabled = false
-local lastChokeTick = 0
+local autoChokeFlyBypass = true
+local lastChokeAttemptAt = 0
+local chokeResumeAt = 0
+local realGetAttribute = Instance.GetAttribute
 
 local sanityFreezeEnabled = false
 local invisVisionEnabled = false
@@ -124,7 +127,10 @@ crossRayLine.Thickness = 1.5
 crossRayLine.Color = Color3.fromRGB(150, 150, 170)
 crossRayLine.Visible = false
 
-local CHOKE_RANGE = 13
+local CHOKE_RANGE = Config.ChokeRange or 13
+local CHOKE_HITBOX_WIDTH = Config.ChokeHitboxWidth or 7
+local CHOKE_FRONT_DOT = 0.5
+local CHOKE_ATTEMPT_INTERVAL = 0.12
 local RING_SIZE = CHOKE_RANGE * 2
 local LASER_TICK = Config.LaserServerTickRate or 0.05
 local LASER_MAX_RANGE = Config.LaserMaxRange or 500
@@ -671,6 +677,145 @@ local function getClosestPlayerInRange(range, useCrosshair)
     return closest
 end
 
+local function faceCharacterForChoke(victimChar)
+    local char = lplr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local victimHrp = victimChar and victimChar:FindFirstChild("HumanoidRootPart")
+    if not hrp or not victimHrp then return end
+    local pos = hrp.Position
+    local flat = Vector3.new(victimHrp.Position.X - pos.X, 0, victimHrp.Position.Z - pos.Z)
+    if flat.Magnitude < 0.05 then return end
+    hrp.CFrame = CFrame.lookAt(pos, pos + flat.Unit)
+end
+
+local function victimPassesChokeHitbox(victimChar, hrp)
+    if not victimChar or not hrp then return false end
+    if victimChar:GetAttribute("Ragdolled") then return false end
+    local victimHrp = victimChar:FindFirstChild("HumanoidRootPart")
+    local hum = victimChar:FindFirstChildOfClass("Humanoid")
+    if not victimHrp or not hum or hum.Health <= 0 then return false end
+
+    local position = hrp.Position
+    local flatLook = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+    if flatLook.Magnitude < 0.01 then return false end
+    local unitLook = flatLook.Unit
+
+    local offset = victimHrp.Position - position
+    local dist = offset.Magnitude
+    if dist > CHOKE_RANGE then return false end
+
+    local flatOffset = offset * Vector3.new(1, 0, 1)
+    if flatOffset.Magnitude < 0.1 then return false end
+    local unitTo = flatOffset.Unit
+    if unitLook:Dot(unitTo) < CHOKE_FRONT_DOT then return false end
+
+    local crossY = unitLook:Cross(unitTo).Y
+    return math.abs(crossY) * dist <= CHOKE_HITBOX_WIDTH / 2
+end
+
+local function findChokeVictimChar()
+    local char = lplr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local bestChar, bestDist = nil, CHOKE_RANGE + 1
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lplr and isPlayerAlive(p) and p.Character then
+            if victimPassesChokeHitbox(p.Character, hrp) then
+                local root = p.Character:FindFirstChild("HumanoidRootPart")
+                local dist = (root.Position - hrp.Position).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    bestChar = p.Character
+                end
+            end
+        end
+    end
+    return bestChar
+end
+
+local function findNearestInChokeRadius()
+    local char = lplr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local pos = hrp.Position
+
+    local bestChar, bestDist = nil, CHOKE_RANGE + 1
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lplr and isPlayerAlive(p) and p.Character then
+            local root = p.Character:FindFirstChild("HumanoidRootPart")
+            if root then
+                local dist = (root.Position - pos).Magnitude
+                if dist <= CHOKE_RANGE and dist < bestDist then
+                    bestDist = dist
+                    bestChar = p.Character
+                end
+            end
+        end
+    end
+    return bestChar
+end
+
+local function canAutoChokeNow()
+    if realGetAttribute(lplr, "Role") ~= Config.Role_Homelander then return false end
+    if realGetAttribute(lplr, "IsChoking") or realGetAttribute(lplr, "IsSuperVision") then return false end
+    local hum = lplr.Character and lplr.Character:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function clearFlyFlagsForChoke()
+    pcall(function()
+        lplr:SetAttribute("IsFlying", nil)
+        lplr:SetAttribute("IsLanding", nil)
+    end)
+end
+
+pcall(function()
+    if typeof(hookfunction) ~= "function" then return end
+    local hooked = hookfunction(Instance.GetAttribute, function(inst, attr)
+        if autoChokeFlyBypass and inst == lplr and (attr == "IsFlying" or attr == "IsLanding") then
+            return nil
+        end
+        return hooked(inst, attr)
+    end)
+end)
+
+local function tryAutoChoke()
+    if not autoChokeEnabled or not canAutoChokeNow() then return end
+
+    local now = tick()
+    if now < chokeResumeAt then return end
+    if now - lastChokeAttemptAt < CHOKE_ATTEMPT_INTERVAL then return end
+
+    local victim = findChokeVictimChar()
+    if not victim then
+        local nearby = findNearestInChokeRadius()
+        if nearby then
+            faceCharacterForChoke(nearby)
+            victim = findChokeVictimChar()
+        end
+    end
+    if not victim then return end
+
+    if autoChokeFlyBypass then
+        clearFlyFlagsForChoke()
+    else
+        if realGetAttribute(lplr, "IsFlying") == true then
+            Network:FireServer("FlightStop")
+            chokeResumeAt = now + 0.45
+            return
+        end
+        if realGetAttribute(lplr, "IsLanding") == true then
+            chokeResumeAt = now + 0.15
+            return
+        end
+    end
+
+    lastChokeAttemptAt = now
+    faceCharacterForChoke(victim)
+    Network:FireServer("ChokeAttempt")
+end
+
 local function stopLaser()
     if not tbLasering then return end
     tbLasering = false
@@ -1041,7 +1186,7 @@ local function syncChokeRings()
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             if hrp and hum and hum.Health > 0 then
-                local inRange = myHrp and (hrp.Position - myHrp.Position).Magnitude <= CHOKE_RANGE
+                local inRange = myHrp and victimPassesChokeHitbox(char, myHrp)
                 local color = ringFillColor(inRange, false)
                 local data = playerRingData[player]
                 if not data or data.hrp ~= hrp or not data.part or not data.part.Parent then
@@ -1079,6 +1224,8 @@ lplr.CharacterAdded:Connect(function()
     tbLasering = false
     laserLockTarget = nil
     lastHadTargetAt = 0
+    lastChokeAttemptAt = 0
+    chokeResumeAt = 0
     if chokeRangeEnabled then
         task.defer(syncChokeRings)
     end
@@ -1237,17 +1384,7 @@ RunService.Heartbeat:Connect(function()
         if charRec then charRec:SetAttribute("IsRecording", nil) end
     end
 
-    -- AUTO CHOKE
-    if autoChokeEnabled then
-        local t = tick()
-        if t - lastChokeTick >= 6 then
-            local target = getClosestPlayerInRange(CHOKE_RANGE, silentAimEnabled)
-            if target then
-                lastChokeTick = t
-                Network:FireServer("ChokeAttempt")
-            end
-        end
-    end
+    tryAutoChoke()
 
     if chokeRangeEnabled and tick() - lastRingSync >= RING_SYNC_INTERVAL then
         lastRingSync = tick()
@@ -1622,7 +1759,10 @@ aimSec:Slider("Smoothing", 1, 100, function(val) aimSmoothing = val / 100 end)
 
 local hlSec = combatTab:Section("Homelander")
 hlSec:ToggleKeyBind("Auto Choke", Enum.KeyCode.C, function(on) autoChokeEnabled = on end)
-hlSec:Credit("Choke range ring: Visuals tab, F4.")
+hlSec:Toggle("Choke in flight", function(on) autoChokeFlyBypass = on end)
+hlSec:Credit("В круге (F4) — без кулдауна в скрипте, поворот к цели.")
+hlSec:Credit("In flight: сброс IsFlying + чок. Если не бьёт — выключи In flight.")
+hlSec:Credit("~6с между удачными чоками — лимит сервера.")
 
 -- Utility
 local survSec = utilityTab:Section("Survivor")
